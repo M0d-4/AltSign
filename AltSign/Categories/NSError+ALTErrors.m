@@ -123,6 +123,15 @@ NSErrorDomain const ALTAppleAPIErrorDomain = @"com.rileytestut.ALTAppleAPI";
             
         case ALTAppleAPIErrorAuthenticationHandshakeFailed:
             return NSLocalizedString(@"Failed to perform authentication handshake with server.", @"");
+            
+        case ALTAppleAPIErrorTooManyVerificationAttempts:
+            return NSLocalizedString(@"Too many verification attempts. Please wait a while before trying again.", @"");
+            
+        case ALTAppleAPIErrorVerificationCancelled:
+            return NSLocalizedString(@"Verification was cancelled.", @"");
+            
+        case ALTAppleAPIErrorVerificationFailed:
+            return NSLocalizedString(@"Apple couldn't verify this sign-in.", @"");
     }
     
     return nil;

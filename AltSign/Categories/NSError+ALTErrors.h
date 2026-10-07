@@ -50,6 +50,11 @@ typedef NS_ERROR_ENUM(ALTAppleAPIErrorDomain, ALTAppleAPIError)
     ALTAppleAPIErrorRequiresTwoFactorAuthentication,
     ALTAppleAPIErrorIncorrectVerificationCode,
     ALTAppleAPIErrorAuthenticationHandshakeFailed,
+    
+    // Added after AuthenticationHandshakeFailed so existing raw values stay stable.
+    ALTAppleAPIErrorTooManyVerificationAttempts,
+    ALTAppleAPIErrorVerificationCancelled,
+    ALTAppleAPIErrorVerificationFailed,
 };
 
 NS_ASSUME_NONNULL_BEGIN

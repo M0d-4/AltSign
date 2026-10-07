@@ -183,12 +183,183 @@ NSData *ALTCreateAppTokensChecksum(NSData *sk, NSString *adsid, NSArray<NSString
     return checksum;
 }
 
+#pragma mark - Two-Factor Models
+
+@implementation ALTTrustedPhoneNumber
+
+- (instancetype)initWithIdentifier:(NSString *)identifier displayNumber:(NSString *)displayNumber
+{
+    self = [super init];
+    if (self)
+    {
+        _identifier = [identifier copy];
+        _displayNumber = [displayNumber copy];
+    }
+    
+    return self;
+}
+
+- (NSString *)description
+{
+    return [NSString stringWithFormat:@"<ALTTrustedPhoneNumber %@: %@>", self.identifier, self.displayNumber];
+}
+
+@end
+
+@interface ALTTwoFactorRequest ()
+
+@property (nonatomic, readwrite) ALTTwoFactorStep step;
+@property (nonatomic, readwrite) ALTTwoFactorMethod preferredMethod;
+@property (nonatomic, readwrite) ALTTwoFactorMethod activeMethod;
+@property (nonatomic, copy, readwrite) NSArray<ALTTrustedPhoneNumber *> *phoneNumbers;
+@property (nonatomic, copy, readwrite, nullable) NSString *activePhoneID;
+@property (nonatomic, copy, readwrite, nullable) NSString *errorMessage;
+@property (nonatomic, readwrite) BOOL supportsTrustedDevice;
+
+@end
+
+@implementation ALTTwoFactorRequest
+
+- (NSString *)description
+{
+    return [NSString stringWithFormat:@"<ALTTwoFactorRequest step: %@ active: %@ phones: %@ error: %@>", @(self.step), @(self.activeMethod), self.phoneNumbers, self.errorMessage];
+}
+
+@end
+
+@interface ALTTwoFactorResponse ()
+
+@property (nonatomic, readwrite) ALTTwoFactorAction action;
+@property (nonatomic, copy, readwrite, nullable) NSString *phoneID;
+@property (nonatomic, copy, readwrite, nullable) NSString *code;
+@property (nonatomic, strong, readwrite, nullable) NSError *error;
+
+@end
+
+@implementation ALTTwoFactorResponse
+
++ (instancetype)responseWithAction:(ALTTwoFactorAction)action
+{
+    ALTTwoFactorResponse *response = [[ALTTwoFactorResponse alloc] init];
+    response.action = action;
+    return response;
+}
+
++ (instancetype)requestTrustedDevice
+{
+    return [self responseWithAction:ALTTwoFactorActionRequestTrustedDevice];
+}
+
++ (instancetype)requestSMSWithPhoneID:(NSString *)phoneID
+{
+    ALTTwoFactorResponse *response = [self responseWithAction:ALTTwoFactorActionRequestSMS];
+    response.phoneID = phoneID;
+    return response;
+}
+
++ (instancetype)requestVoiceWithPhoneID:(NSString *)phoneID
+{
+    ALTTwoFactorResponse *response = [self responseWithAction:ALTTwoFactorActionRequestVoice];
+    response.phoneID = phoneID;
+    return response;
+}
+
++ (instancetype)submitCode:(NSString *)code
+{
+    ALTTwoFactorResponse *response = [self responseWithAction:ALTTwoFactorActionSubmitCode];
+    response.code = code;
+    return response;
+}
+
++ (instancetype)cancel
+{
+    return [self responseWithAction:ALTTwoFactorActionCancel];
+}
+
++ (instancetype)failWithError:(NSError *)error
+{
+    ALTTwoFactorResponse *response = [self responseWithAction:ALTTwoFactorActionFail];
+    response.error = error;
+    return response;
+}
+
+@end
+
+/// Mutable bookkeeping for one in-flight two-factor sign-in.
+@interface ALTTwoFactorState : NSObject
+
+@property (nonatomic, copy) NSString *dsid;
+@property (nonatomic, copy) NSString *idmsToken;
+@property (nonatomic, strong) ALTAnisetteData *anisetteData;
+@property (nonatomic, strong) NSMutableArray<ALTTrustedPhoneNumber *> *phoneNumbers;
+@property (nonatomic) ALTTwoFactorMethod preferredMethod;
+@property (nonatomic) BOOL supportsTrustedDevice;
+
+@property (nonatomic) ALTTwoFactorMethod activeMethod;
+@property (nonatomic, copy, nullable) NSString *activePhoneID;
+@property (nonatomic) BOOL hasActiveMethod;
+
+@end
+
+@implementation ALTTwoFactorState
+@end
+
 @implementation ALTAppleAPI (Authentication)
+
+#pragma mark - Legacy entry point
 
 - (void)authenticateWithAppleID:(NSString *)appleID
                        password:(NSString *)password
                    anisetteData:(ALTAnisetteData *)anisetteData
             verificationHandler:(void (^)(void (^ _Nonnull)(NSString * _Nullable)))verificationHandler
+              completionHandler:(void (^)(ALTAccount * _Nullable, ALTAppleAPISession * _Nullable, NSError * _Nullable))completionHandler
+{
+    ALTTwoFactorHandler twoFactorHandler = nil;
+    
+    if (verificationHandler != nil)
+    {
+        // Old callers only understand "enter the code sent to your devices", so adapt that onto the
+        // multi-method flow: always use a trusted device, ask for the code once, and don't retry.
+        twoFactorHandler = ^(ALTTwoFactorRequest *request, void (^completion)(ALTTwoFactorResponse *response)) {
+            if (request.errorMessage != nil)
+            {
+                NSError *error = [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorIncorrectVerificationCode userInfo:nil];
+                completion([ALTTwoFactorResponse failWithError:error]);
+                return;
+            }
+            
+            switch (request.step)
+            {
+                case ALTTwoFactorStepSelectMethod:
+                    completion([ALTTwoFactorResponse requestTrustedDevice]);
+                    break;
+                    
+                case ALTTwoFactorStepEnterCode:
+                    verificationHandler(^(NSString *_Nullable verificationCode) {
+                        if (verificationCode == nil)
+                        {
+                            NSError *error = [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorRequiresTwoFactorAuthentication userInfo:nil];
+                            completion([ALTTwoFactorResponse failWithError:error]);
+                        }
+                        else
+                        {
+                            completion([ALTTwoFactorResponse submitCode:verificationCode]);
+                        }
+                    });
+                    break;
+            }
+        };
+    }
+    
+    [self authenticateWithAppleID:appleID password:password anisetteData:anisetteData twoFactorHandler:twoFactorHandler completionHandler:completionHandler];
+}
+
+#pragma mark - Authentication
+
+- (void)authenticateWithAppleID:(NSString *)appleID
+                       password:(NSString *)password
+                   anisetteData:(ALTAnisetteData *)anisetteData
+               twoFactorHandler:(ALTTwoFactorHandler)twoFactorHandler
               completionHandler:(void (^)(ALTAccount * _Nullable, ALTAppleAPISession * _Nullable, NSError * _Nullable))completionHandler
 {
     NSMutableDictionary *clientDictionary = [@{
@@ -408,17 +579,33 @@ NSData *ALTCreateAppTokensChecksum(NSData *sk, NSString *adsid, NSArray<NSString
             NSDictionary *statusDictionary = responseDictionary[@"Status"];
             
             NSString *authType = statusDictionary[@"au"];
-            if ([authType isEqualToString:@"trustedDeviceSecondaryAuth"])
+            if ([self isTwoFactorAuthType:authType])
             {
                 // Handle Two-Factor
                 
-                if (verificationHandler != nil)
+                if (twoFactorHandler != nil)
                 {
-                    [self requestTwoFactorCodeForDSID:adsid idmsToken:idmsToken anisetteData:anisetteData verificationHandler:verificationHandler completionHandler:^(BOOL success, NSError *error) {
+                    BOOL isTrustedDevice = ([authType isEqualToString:@"trustedDeviceSecondaryAuth"] || [authType isEqualToString:@"trustedDevice"]);
+                    
+                    NSMutableArray<ALTTrustedPhoneNumber *> *phoneNumbers = [[self parseTrustedPhoneNumbersFromDictionary:responseDictionary] mutableCopy];
+                    if (phoneNumbers.count == 0)
+                    {
+                        [phoneNumbers addObjectsFromArray:[self parseTrustedPhoneNumbersFromDictionary:statusDictionary]];
+                    }
+                    
+                    ALTTwoFactorState *state = [[ALTTwoFactorState alloc] init];
+                    state.dsid = adsid;
+                    state.idmsToken = idmsToken;
+                    state.anisetteData = anisetteData;
+                    state.phoneNumbers = phoneNumbers;
+                    state.preferredMethod = isTrustedDevice ? ALTTwoFactorMethodTrustedDevice : ALTTwoFactorMethodSMS;
+                    state.supportsTrustedDevice = isTrustedDevice;
+                    
+                    [self performTwoFactorWithState:state handler:twoFactorHandler completionHandler:^(BOOL success, NSError *error) {
                         if (success)
                         {
                             // We've successfully signed-in with two-factor, so restart authentication (which will now succeed).
-                            [self authenticateWithAppleID:appleID password:password anisetteData:anisetteData verificationHandler:verificationHandler completionHandler:completionHandler];
+                            [self authenticateWithAppleID:appleID password:password anisetteData:anisetteData twoFactorHandler:twoFactorHandler completionHandler:completionHandler];
                         }
                         else
                         {
@@ -532,19 +719,150 @@ NSData *ALTCreateAppTokensChecksum(NSData *sk, NSString *adsid, NSArray<NSString
     }];
 }
 
-- (void)requestTwoFactorCodeForDSID:(NSString *)dsid idmsToken:(NSString *)idmsToken anisetteData:(ALTAnisetteData *)anisetteData
-                verificationHandler:(nonnull void (^)(void (^ _Nonnull)(NSString * _Nonnull)))verificationHandler
-                  completionHandler:(void (^)(BOOL success, NSError *error))completionHandler
+#pragma mark - Two-Factor Flow
+
+- (BOOL)isTwoFactorAuthType:(NSString *)authType
 {
-    NSURL *URL = [NSURL URLWithString:@"https://gsa.apple.com/auth/verify/trusteddevice"];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL];
+    if (![authType isKindOfClass:[NSString class]])
+    {
+        return NO;
+    }
     
-    NSString *identityToken = [NSString stringWithFormat:@"%@:%@", dsid, idmsToken];
+    static NSSet<NSString *> *types = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        types = [NSSet setWithArray:@[@"trustedDeviceSecondaryAuth", @"trustedDevice", @"secondaryAuth", @"sms", @"voice", @"phone"]];
+    });
     
-    NSData *identityTokenData = [identityToken dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *encodedIdentityToken = [identityTokenData base64EncodedStringWithOptions:0];
+    return [types containsObject:authType];
+}
+
+/// Drives the whole 2FA exchange: asks the handler what to do, performs it, and loops until the code is
+/// accepted, the user cancels, or something unrecoverable happens.
+- (void)performTwoFactorWithState:(ALTTwoFactorState *)state
+                          handler:(ALTTwoFactorHandler)handler
+                completionHandler:(void (^)(BOOL success, NSError *_Nullable error))completionHandler
+{
+    __block void (^prompt)(ALTTwoFactorStep, NSString *) = nil;
+    __block BOOL finished = NO;
     
-    NSDictionary<NSString *, NSString *> *httpHeaders = @{
+    void (^finish)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+        if (finished)
+        {
+            return;
+        }
+        
+        finished = YES;
+        prompt = nil; // Break the retain cycle.
+        completionHandler(success, error);
+    };
+    
+    prompt = ^(ALTTwoFactorStep step, NSString *errorMessage) {
+        ALTTwoFactorRequest *request = [[ALTTwoFactorRequest alloc] init];
+        request.step = step;
+        request.preferredMethod = state.preferredMethod;
+        request.activeMethod = state.activeMethod;
+        request.phoneNumbers = [state.phoneNumbers copy];
+        request.activePhoneID = state.activePhoneID;
+        request.errorMessage = errorMessage;
+        request.supportsTrustedDevice = state.supportsTrustedDevice;
+        
+        handler(request, ^(ALTTwoFactorResponse *response) {
+            switch (response.action)
+            {
+                case ALTTwoFactorActionCancel:
+                    finish(NO, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationCancelled userInfo:nil]);
+                    break;
+                    
+                case ALTTwoFactorActionFail:
+                    finish(NO, response.error ?: [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:nil]);
+                    break;
+                    
+                case ALTTwoFactorActionRequestTrustedDevice:
+                    [self sendTrustedDeviceCodeRequestWithState:state completionHandler:^(NSError *error) {
+                        if (error != nil)
+                        {
+                            // Let the user pick another way to receive a code instead of failing the whole sign-in.
+                            prompt(ALTTwoFactorStepSelectMethod, error.localizedDescription);
+                            return;
+                        }
+                        
+                        state.activeMethod = ALTTwoFactorMethodTrustedDevice;
+                        state.activePhoneID = nil;
+                        state.hasActiveMethod = YES;
+                        prompt(ALTTwoFactorStepEnterCode, nil);
+                    }];
+                    break;
+                    
+                case ALTTwoFactorActionRequestSMS:
+                case ALTTwoFactorActionRequestVoice:
+                {
+                    ALTTwoFactorMethod method = (response.action == ALTTwoFactorActionRequestSMS) ? ALTTwoFactorMethodSMS : ALTTwoFactorMethodVoice;
+                    
+                    [self sendPhoneCodeRequestWithMethod:method phoneID:response.phoneID state:state completionHandler:^(NSString *phoneID, NSError *error) {
+                        if (error != nil)
+                        {
+                            prompt(ALTTwoFactorStepSelectMethod, error.localizedDescription);
+                            return;
+                        }
+                        
+                        state.activeMethod = method;
+                        state.activePhoneID = phoneID;
+                        state.hasActiveMethod = YES;
+                        prompt(ALTTwoFactorStepEnterCode, nil);
+                    }];
+                    break;
+                }
+                    
+                case ALTTwoFactorActionSubmitCode:
+                {
+                    if (!state.hasActiveMethod)
+                    {
+                        // The handler skipped choosing a delivery method, so there's nothing to verify against.
+                        prompt(ALTTwoFactorStepSelectMethod, nil);
+                        break;
+                    }
+                    
+                    NSString *code = [response.code stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                    if (code.length == 0)
+                    {
+                        prompt(ALTTwoFactorStepEnterCode, nil);
+                        break;
+                    }
+                    
+                    [self validateTwoFactorCode:code state:state completionHandler:^(BOOL success, NSString *retryMessage, NSError *error) {
+                        if (success)
+                        {
+                            finish(YES, nil);
+                        }
+                        else if (retryMessage != nil)
+                        {
+                            prompt(ALTTwoFactorStepEnterCode, retryMessage);
+                        }
+                        else
+                        {
+                            finish(NO, error);
+                        }
+                    }];
+                    break;
+                }
+            }
+        });
+    };
+    
+    prompt(ALTTwoFactorStepSelectMethod, nil);
+}
+
+#pragma mark Requests
+
+- (NSDictionary<NSString *, NSString *> *)twoFactorHeadersWithState:(ALTTwoFactorState *)state
+{
+    ALTAnisetteData *anisetteData = state.anisetteData;
+    
+    NSString *identityToken = [NSString stringWithFormat:@"%@:%@", state.dsid, state.idmsToken];
+    NSString *encodedIdentityToken = [[identityToken dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+    
+    return @{
         @"Content-Type": @"text/x-xml-plist",
         @"User-Agent": @"Xcode",
         @"Accept": @"text/x-xml-plist",
@@ -560,92 +878,366 @@ NSData *ALTCreateAppTokensChecksum(NSData *sk, NSString *adsid, NSArray<NSString
         @"X-MMe-Client-Info": anisetteData.deviceDescription,
         @"X-Apple-I-Client-Time": [self.dateFormatter stringFromDate:anisetteData.date],
         @"X-Apple-Locale": anisetteData.locale.localeIdentifier,
-        @"X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation
+        @"X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation,
+        @"X-Apple-I-SRL-NO": anisetteData.deviceSerialNumber ?: @"",
     };
+}
+
+/// The phone endpoints answer with Apple's "buddyml" UI markup, so they need a slightly different Accept/Content-Type.
+- (NSMutableURLRequest *)phoneRequestWithURL:(NSURL *)URL state:(ALTTwoFactorState *)state
+{
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL];
     
-    [httpHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+    [[self twoFactorHeadersWithState:state] enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
         [request setValue:value forHTTPHeaderField:key];
     }];
     
-    NSURLSessionDataTask *requestCodeTask = [self.session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+    [request setValue:@"application/x-buddyml" forHTTPHeaderField:@"Accept"];
+    [request setValue:@"application/x-plist" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:@"close" forHTTPHeaderField:@"Connection"];
+    
+    return request;
+}
+
+- (void)sendTrustedDeviceCodeRequestWithState:(ALTTwoFactorState *)state completionHandler:(void (^)(NSError *_Nullable error))completionHandler
+{
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://gsa.apple.com/auth/verify/trusteddevice"]];
+    
+    [[self twoFactorHeadersWithState:state] enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+        [request setValue:value forHTTPHeaderField:key];
+    }];
+    
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (data == nil || error != nil)
         {
-            completionHandler(NO, error);
+            completionHandler(error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil]);
             return;
         }
         
-        void (^responseHandler)(NSString *) = ^(NSString *_Nullable verificationCode) {
-            if (verificationCode == nil)
-            {
-                completionHandler(NO, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorRequiresTwoFactorAuthentication userInfo:nil]);
-                return;
-            }
-
-            NSMutableDictionary<NSString *, NSString *> *headers = [httpHeaders mutableCopy];
-            headers[@"security-code"] = verificationCode;
-            
-            NSURL *URL = [NSURL URLWithString:@"https://gsa.apple.com/grandslam/GsService2/validate"];
-            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:URL];
-            
-            [headers enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
-                [request setValue:value forHTTPHeaderField:key];
-            }];
-            
-            NSURLSessionDataTask *verifyCodeTask = [self.session dataTaskWithRequest:request completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-                if (data == nil || error != nil)
-                {
-                    completionHandler(NO, error);
-                    return;
-                }
-                
-                NSError *parseError = nil;
-                NSDictionary *responseDictionary = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:&parseError];
-                
-                if (responseDictionary == nil)
-                {
-                    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:@{NSUnderlyingErrorKey: parseError}];
-                    completionHandler(NO, error);
-                    return;
-                }
-                
-                NSInteger errorCode = [responseDictionary[@"ec"] integerValue]; // Same for NSString or NSNumber.
-                if (errorCode != 0)
-                {
-                    NSError *error = nil;
-                    switch (errorCode)
-                    {
-                        case -21669:
-                            error = [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorIncorrectVerificationCode userInfo:nil];
-                            break;
-                            
-                        default:
-                            break;
-                    }
-                    
-                    if (error == nil)
-                    {
-                        NSString *errorDescription = responseDictionary[@"em"];
-                        NSString *localizedDescription = [NSString stringWithFormat:@"%@ (%@)", errorDescription, @(errorCode)];
-                        
-                        error = [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorUnknown userInfo:@{NSLocalizedDescriptionKey: localizedDescription}];
-                    }
-                    
-                    completionHandler(NO, error);
-                }
-                else
-                {
-                    completionHandler(YES, nil);
-                }
-            }];
-            
-            [verifyCodeTask resume];
-        };
+        NSInteger statusCode = [(NSHTTPURLResponse *)response isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)response statusCode] : 0;
         
-        verificationHandler(responseHandler);
+        NSError *alertError = [self errorForXMLUIAlertInData:data];
+        if (alertError != nil)
+        {
+            completionHandler(alertError);
+            return;
+        }
+        
+        if (statusCode != 200)
+        {
+            NSString *message = [NSString stringWithFormat:NSLocalizedString(@"Couldn't send a code to your devices (HTTP %@).", @""), @(statusCode)];
+            completionHandler([NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        
+        completionHandler(nil);
     }];
     
-    [requestCodeTask resume];
+    [task resume];
 }
+
+- (void)sendPhoneCodeRequestWithMethod:(ALTTwoFactorMethod)method
+                               phoneID:(NSString *)requestedPhoneID
+                                 state:(ALTTwoFactorState *)state
+                     completionHandler:(void (^)(NSString *_Nullable phoneID, NSError *_Nullable error))completionHandler
+{
+    NSString *mode = (method == ALTTwoFactorMethodVoice) ? @"voice" : @"sms";
+    
+    NSString *phoneID = [requestedPhoneID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (phoneID.length == 0)
+    {
+        // Apple's primary trusted number.
+        phoneID = state.phoneNumbers.firstObject.identifier ?: @"1";
+    }
+    
+    NSString *URLString = [NSString stringWithFormat:@"https://gsa.apple.com/auth/verify/phone/put?mode=%@", mode];
+    NSMutableURLRequest *request = [self phoneRequestWithURL:[NSURL URLWithString:URLString] state:state];
+    request.HTTPMethod = @"POST";
+    
+    NSDictionary *body = @{@"serverInfo": @{@"mode": mode, @"phoneNumber.id": phoneID}};
+    request.HTTPBody = [NSPropertyListSerialization dataWithPropertyList:body format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+    
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (data == nil || error != nil)
+        {
+            completionHandler(nil, error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil]);
+            return;
+        }
+        
+        NSInteger statusCode = [(NSHTTPURLResponse *)response isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)response statusCode] : 0;
+        
+        NSError *alertError = [self errorForXMLUIAlertInData:data];
+        if (alertError != nil)
+        {
+            completionHandler(nil, alertError);
+            return;
+        }
+        
+        NSDictionary *responseDictionary = [self propertyListOrJSONFromData:data];
+        NSInteger errorCode = [responseDictionary[@"ec"] integerValue];
+        
+        if ([self isRateLimitErrorCode:errorCode statusCode:statusCode])
+        {
+            completionHandler(nil, [self rateLimitErrorWithMessage:responseDictionary[@"em"]]);
+            return;
+        }
+        
+        if (errorCode != 0)
+        {
+            NSString *message = responseDictionary[@"em"] ?: [NSString stringWithFormat:NSLocalizedString(@"Couldn't send a code (%@).", @""), @(errorCode)];
+            completionHandler(nil, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        
+        if (statusCode != 200)
+        {
+            NSString *message = [NSString stringWithFormat:NSLocalizedString(@"Couldn't send a code (HTTP %@).", @""), @(statusCode)];
+            completionHandler(nil, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        
+        // Apple echoes back the phone it actually used, and often a masked version of the number.
+        NSString *string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSString *usedPhoneID = [self firstMatchForPattern:@"(?<=phoneNumber\\.id=\")[^\"]+" inString:string] ?: phoneID;
+        
+        NSString *obfuscated = [self firstMatchForPattern:@"(?<=obfuscatedNumber=\")[^\"]+" inString:string]
+            ?: [self firstMatchForPattern:@"(?<=numberWithDialCode=\")[^\"]+" inString:string];
+        
+        if (obfuscated != nil && ![state.phoneNumbers filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"identifier == %@", usedPhoneID]].count)
+        {
+            [state.phoneNumbers addObject:[[ALTTrustedPhoneNumber alloc] initWithIdentifier:usedPhoneID displayNumber:obfuscated]];
+        }
+        
+        completionHandler(usedPhoneID, nil);
+    }];
+    
+    [task resume];
+}
+
+- (void)validateTwoFactorCode:(NSString *)code
+                        state:(ALTTwoFactorState *)state
+            completionHandler:(void (^)(BOOL success, NSString *_Nullable retryMessage, NSError *_Nullable error))completionHandler
+{
+    BOOL isTrustedDevice = (state.activeMethod == ALTTwoFactorMethodTrustedDevice);
+    
+    NSMutableURLRequest *request = nil;
+    if (isTrustedDevice)
+    {
+        request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://gsa.apple.com/grandslam/GsService2/validate"]];
+        
+        [[self twoFactorHeadersWithState:state] enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSString *value, BOOL *stop) {
+            [request setValue:value forHTTPHeaderField:key];
+        }];
+        [request setValue:code forHTTPHeaderField:@"security-code"];
+    }
+    else
+    {
+        NSString *mode = (state.activeMethod == ALTTwoFactorMethodVoice) ? @"voice" : @"sms";
+        NSString *phoneID = state.activePhoneID ?: (state.phoneNumbers.firstObject.identifier ?: @"1");
+        
+        request = [self phoneRequestWithURL:[NSURL URLWithString:@"https://gsa.apple.com/auth/verify/phone/securitycode?referrer=/auth/verify/phone/put"] state:state];
+        request.HTTPMethod = @"POST";
+        
+        NSDictionary *body = @{
+            @"securityCode": @{@"code": code},
+            @"serverInfo": @{@"mode": mode, @"phoneNumber.id": phoneID},
+        };
+        request.HTTPBody = [NSPropertyListSerialization dataWithPropertyList:body format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
+    }
+    
+    NSURLSessionDataTask *task = [self.session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (data == nil || error != nil)
+        {
+            completionHandler(NO, nil, error ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil]);
+            return;
+        }
+        
+        NSHTTPURLResponse *httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+        NSInteger statusCode = httpResponse.statusCode;
+        
+        NSDictionary *responseDictionary = [self propertyListOrJSONFromData:data];
+        NSDictionary *statusDictionary = [responseDictionary[@"Status"] isKindOfClass:[NSDictionary class]] ? responseDictionary[@"Status"] : nil;
+        NSInteger errorCode = [responseDictionary[@"ec"] integerValue]; // Same for NSString or NSNumber.
+        
+        NSString *alertTitle = nil;
+        NSString *alertMessage = nil;
+        [self parseXMLUIAlertFromData:data title:&alertTitle message:&alertMessage];
+        
+        NSString *errorMessage = responseDictionary[@"em"] ?: statusDictionary[@"em"] ?: alertMessage ?: alertTitle;
+        
+        if ([self isRateLimitErrorCode:errorCode statusCode:statusCode])
+        {
+            completionHandler(NO, nil, [self rateLimitErrorWithMessage:errorMessage]);
+            return;
+        }
+        
+        if (errorCode == -21669)
+        {
+            completionHandler(NO, errorMessage ?: NSLocalizedString(@"Incorrect verification code. Please try again.", @""), nil);
+            return;
+        }
+        
+        if (errorCode != 0)
+        {
+            NSString *description = [NSString stringWithFormat:@"%@ (%@)", errorMessage ?: NSLocalizedString(@"Verification error", @""), @(errorCode)];
+            completionHandler(NO, nil, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorUnknown userInfo:@{NSLocalizedDescriptionKey: description}]);
+            return;
+        }
+        
+        if (alertTitle != nil || alertMessage != nil)
+        {
+            NSString *message = alertMessage ?: errorMessage ?: alertTitle ?: NSLocalizedString(@"Verification failed", @"");
+            completionHandler(NO, nil, [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        
+        if (statusCode != 200)
+        {
+            completionHandler(NO, errorMessage ?: NSLocalizedString(@"Incorrect verification code. Please try again.", @""), nil);
+            return;
+        }
+        
+        if (!isTrustedDevice)
+        {
+            // A phone code is only accepted if Apple hands back its "PE" token.
+            BOOL hasPEToken = NO;
+            for (id key in httpResponse.allHeaderFields)
+            {
+                if ([key isKindOfClass:[NSString class]] && [(NSString *)key caseInsensitiveCompare:@"x-apple-pe-token"] == NSOrderedSame)
+                {
+                    hasPEToken = YES;
+                    break;
+                }
+            }
+            
+            if (!hasPEToken)
+            {
+                completionHandler(NO, errorMessage ?: NSLocalizedString(@"Incorrect verification code. Please try again.", @""), nil);
+                return;
+            }
+        }
+        
+        completionHandler(YES, nil, nil);
+    }];
+    
+    [task resume];
+}
+
+#pragma mark Parsing
+
+- (BOOL)isRateLimitErrorCode:(NSInteger)errorCode statusCode:(NSInteger)statusCode
+{
+    // -21668: too many attempts, -20102: too many codes requested, -22411: rate limited.
+    return (errorCode == -21668 || errorCode == -20102 || errorCode == -22411 || statusCode == 429);
+}
+
+- (NSError *)rateLimitErrorWithMessage:(NSString *)message
+{
+    NSDictionary *userInfo = message.length > 0 ? @{NSLocalizedDescriptionKey: message} : nil;
+    return [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorTooManyVerificationAttempts userInfo:userInfo];
+}
+
+- (NSDictionary *)propertyListOrJSONFromData:(NSData *)data
+{
+    id object = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:nil];
+    if (![object isKindOfClass:[NSDictionary class]])
+    {
+        object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    }
+    
+    return [object isKindOfClass:[NSDictionary class]] ? object : nil;
+}
+
+- (NSString *)firstMatchForPattern:(NSString *)pattern inString:(NSString *)string
+{
+    if (string == nil)
+    {
+        return nil;
+    }
+    
+    NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    NSTextCheckingResult *match = [expression firstMatchInString:string options:0 range:NSMakeRange(0, string.length)];
+    return match ? [string substringWithRange:match.range] : nil;
+}
+
+/// Apple reports some failures as a buddyml `<alert title="…" message="…">` rather than a status code.
+- (void)parseXMLUIAlertFromData:(NSData *)data title:(NSString **)outTitle message:(NSString **)outMessage
+{
+    NSString *string = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (string == nil || [string containsString:@"<pinView"])
+    {
+        return;
+    }
+    
+    NSString *tag = [self firstMatchForPattern:@"<alert(?![^>]*\\bid=)[^>]*>" inString:string];
+    if (tag == nil)
+    {
+        return;
+    }
+    
+    *outTitle = [self firstMatchForPattern:@"(?<=title=\")[^\"]+" inString:tag];
+    *outMessage = [self firstMatchForPattern:@"(?<=message=\")[^\"]+" inString:tag];
+}
+
+- (NSError *)errorForXMLUIAlertInData:(NSData *)data
+{
+    NSString *title = nil;
+    NSString *message = nil;
+    [self parseXMLUIAlertFromData:data title:&title message:&message];
+    
+    NSString *text = message ?: title;
+    if (text == nil)
+    {
+        return nil;
+    }
+    
+    return [NSError errorWithDomain:ALTAppleAPIErrorDomain code:ALTAppleAPIErrorVerificationFailed userInfo:@{NSLocalizedDescriptionKey: text}];
+}
+
+- (NSArray<ALTTrustedPhoneNumber *> *)parseTrustedPhoneNumbersFromDictionary:(NSDictionary *)dictionary
+{
+    if (![dictionary isKindOfClass:[NSDictionary class]])
+    {
+        return @[];
+    }
+    
+    NSArray *list = dictionary[@"trustedPhoneNumbers"] ?: dictionary[@"phoneNumbers"];
+    if (![list isKindOfClass:[NSArray class]])
+    {
+        list = nil;
+    }
+    
+    if (list.count == 0 && [dictionary[@"phoneNumber"] isKindOfClass:[NSDictionary class]])
+    {
+        list = @[dictionary[@"phoneNumber"]];
+    }
+    
+    NSMutableArray<ALTTrustedPhoneNumber *> *numbers = [NSMutableArray array];
+    for (NSDictionary *item in list)
+    {
+        if (![item isKindOfClass:[NSDictionary class]])
+        {
+            continue;
+        }
+        
+        NSString *identifier = [[NSString stringWithFormat:@"%@", item[@"id"] ?: @""] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (identifier.length == 0)
+        {
+            continue;
+        }
+        
+        NSString *display = item[@"numberWithDialCode"] ?: item[@"obfuscatedNumber"];
+        if (display == nil && item[@"lastTwoDigits"] != nil)
+        {
+            display = [NSString stringWithFormat:@"••%@", item[@"lastTwoDigits"]];
+        }
+        
+        [numbers addObject:[[ALTTrustedPhoneNumber alloc] initWithIdentifier:identifier displayNumber:display ?: [NSString stringWithFormat:@"Phone %@", identifier]]];
+    }
+    
+    return numbers;
+}
+
 
 - (void)fetchAccountForSession:(ALTAppleAPISession *)session completionHandler:(void (^)(ALTAccount *account, NSError *error))completionHandler
 {
