@@ -194,6 +194,15 @@ NSErrorUserInfoKey const ALTHTTPStatusCode = @"HTTPStatusCode";
         case ALTAppleAPIErrorInvalidAnisetteData:
             return NSLocalizedString(@"The provided anisette data is invalid.", @"");
             
+        case ALTAppleAPIErrorTooManyVerificationAttempts:
+            return NSLocalizedString(@"Too many verification attempts. Please wait a while before trying again.", @"");
+            
+        case ALTAppleAPIErrorVerificationCancelled:
+            return NSLocalizedString(@"Verification was cancelled.", @"");
+            
+        case ALTAppleAPIErrorVerificationFailed:
+            return NSLocalizedString(@"Apple couldn't verify this sign-in.", @"");
+            
         case ALTAppleAPIErrorInvalidCapability:
             return NSLocalizedString(@"The requested App ID capability is invalid.", @"");
     }

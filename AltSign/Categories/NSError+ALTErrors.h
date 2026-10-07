@@ -60,6 +60,10 @@ typedef NS_ERROR_ENUM(ALTAppleAPIErrorDomain, ALTAppleAPIError)
     
     ALTAppleAPIErrorInvalidAnisetteData = 3021,
     
+    ALTAppleAPIErrorTooManyVerificationAttempts = 3022,
+    ALTAppleAPIErrorVerificationCancelled = 3023,
+    ALTAppleAPIErrorVerificationFailed = 3024,
+    
     ALTAppleAPIErrorInvalidCapability = 3050
 };
 
